@@ -1,0 +1,92 @@
+name: iOS unsigned IPA
+
+# Builds a Release .ipa with code signing turned off, for sideloading
+# from Windows (e.g. Sideloadly) with a free Apple ID.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+
+concurrency:
+  group: ios-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    # Expo SDK 58 needs Xcode 26.4+, which the macOS 26 image ships by default.
+    runs-on: macos-26
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install JS dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm test
+
+      - name: Generate ios/ project
+        run: npx expo prebuild --platform ios --no-install
+
+      - name: Install CocoaPods dependencies
+        run: |
+          cd ios
+          pod install
+
+      - name: Build Release app (unsigned)
+        run: |
+          set -eo pipefail
+          WORKSPACE=$(ls -d ios/*.xcworkspace | head -n 1)
+          SCHEME=$(basename "$WORKSPACE" .xcworkspace)
+          echo "Workspace: $WORKSPACE  Scheme: $SCHEME"
+          xcodebuild \
+            -workspace "$WORKSPACE" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            | tee xcodebuild.log | grep -E "^(error|warning: unable|\*\* |▸|Ld |CompileSwift normal)|error:" || true
+          # grep hides the exit code, so check the result explicitly.
+          if ! grep -q "\*\* BUILD SUCCEEDED \*\*" xcodebuild.log; then
+            echo "::error::xcodebuild failed. Last 200 lines of the log:"
+            tail -n 200 xcodebuild.log
+            exit 1
+          fi
+
+      - name: Package .ipa
+        run: |
+          set -eo pipefail
+          APP=$(ls -d build/Build/Products/Release-iphoneos/*.app | head -n 1)
+          echo "App bundle: $APP"
+          mkdir -p Payload
+          cp -R "$APP" Payload/
+          zip -qry RunWalk-unsigned.ipa Payload
+          ls -lh RunWalk-unsigned.ipa
+
+      - name: Upload .ipa
+        uses: actions/upload-artifact@v4
+        with:
+          name: RunWalk-unsigned-ipa
+          path: RunWalk-unsigned.ipa
+          if-no-files-found: error
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcodebuild-log
+          path: xcodebuild.log
+          if-no-files-found: ignore
